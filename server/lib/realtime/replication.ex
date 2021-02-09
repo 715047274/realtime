@@ -65,8 +65,9 @@ defmodule Realtime.Replication do
       {:ok, epgsql_pid} ->
         {:noreply, %State{state | connection: epgsql_pid}}
 
-      {:error, _reason} ->
-        retry(state)
+      {:error, reason} ->
+        # retry(state)
+        {:stop, reason}
     end
   end
 

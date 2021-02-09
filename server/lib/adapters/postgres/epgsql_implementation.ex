@@ -5,12 +5,24 @@ defmodule Realtime.Adapters.Postgres.EpgsqlImplementation do
   @behaviour Realtime.Adapters.Postgres.AdapterBehaviour
   require Logger
 
-  @impl true
   def init(config) do
-    epgsql_config =
-      Keyword.get(config, :epgsql, %{})
-      |> Map.put(:replication, "database")
+    with {:ok, select_epgsql_pid} <-
+           Postgrex.start_link(
+             hostname: "localhost",
+             username: "postgres",
+             password: "postgres",
+             database: "postgres"
+           ),
+         {:ok, replication_epgsql_pid} <-
+           start_replication(config, select_epgsql_pid) do
+      {:ok, replication_epgsql_pid}
+    else
+      reason ->
+        {:error, reason}
+    end
+  end
 
+  defp start_replication(config, select_epgsql_pid) do
     {xlog, offset} = Keyword.get(config, :wal_position, {"0", "0"})
 
     publication_names =
@@ -18,22 +30,28 @@ defmodule Realtime.Adapters.Postgres.EpgsqlImplementation do
       |> Enum.map(fn pub -> ~s("#{pub}") end)
       |> Enum.join(",")
 
-    with {:ok, epgsql_pid} <- :epgsql.connect(epgsql_config),
+    with {:ok, replication_epgsql_pid} <-
+           Keyword.get(config, :epgsql, %{})
+           |> Map.put(:replication, "database")
+           |> :epgsql.connect(),
          {:ok, slot_name} <-
-           create_replication_slot(epgsql_pid, Keyword.get(config, :slot, :temporary)),
+           create_replication_slot(
+             replication_epgsql_pid,
+             select_epgsql_pid,
+             Keyword.get(config, :slot, :temporary)
+           ),
          :ok <-
            :epgsql.start_replication(
-             epgsql_pid,
+             replication_epgsql_pid,
              slot_name,
              self(),
              [],
              '#{xlog}/#{offset}',
              'proto_version \'1\', publication_names \'#{publication_names}\''
            ) do
-      {:ok, epgsql_pid}
+      {:ok, replication_epgsql_pid}
     else
-      reason ->
-        {:error, reason}
+      reason -> {:error, reason}
     end
   end
 
@@ -49,23 +67,25 @@ defmodule Realtime.Adapters.Postgres.EpgsqlImplementation do
     decimal_lsn
   end
 
-  defp create_replication_slot(epgsql_pid, slot) do
+  defp create_replication_slot(replication_epgsql_pid, select_epgsql_pid, slot) do
     {slot_name, start_replication_command} =
       case slot do
         name when is_binary(name) ->
           # Simple query for replication mode so no prepared statements are supported
           escaped_name = String.downcase(String.replace(name, "'", "\\'"))
+
           query =
             "SELECT COUNT(*) >= 1 FROM pg_replication_slots WHERE slot_name = '#{escaped_name}'"
 
-          {:ok, _, [{existing_slot}]} = :epgsql.squery(epgsql_pid, query)
+          %Postgrex.Result{rows: [[existing_slot]]} =
+            Postgrex.query!(select_epgsql_pid, query, [])
 
           case existing_slot do
-            "t" ->
+            true ->
               # no-op
               {name, "SELECT 1"}
 
-            "f" ->
+            false ->
               {name, "CREATE_REPLICATION_SLOT #{escaped_name} LOGICAL pgoutput NOEXPORT_SNAPSHOT"}
           end
 
@@ -76,12 +96,19 @@ defmodule Realtime.Adapters.Postgres.EpgsqlImplementation do
            "CREATE_REPLICATION_SLOT #{slot_name} TEMPORARY LOGICAL pgoutput NOEXPORT_SNAPSHOT"}
       end
 
-    case :epgsql.squery(epgsql_pid, start_replication_command) do
-      {:ok, _, _} ->
-        {:ok, slot_name}
+    if start_replication_command == "SELECT 1" do
+      Postgrex.query!(select_epgsql_pid, start_replication_command, [])
+      # Process.exit(select_epgsql_pid, :kill)
+      {:ok, slot_name}
+    else
+      case :epgsql.squery(replication_epgsql_pid, start_replication_command) do
+        {:ok, _, _} ->
+          # Process.exit(select_epgsql_pid, :kill)
+          {:ok, slot_name}
 
-      {:error, epgsql_error} ->
-        {:error, epgsql_error}
+        {:error, epgsql_error} ->
+          {:error, epgsql_error}
+      end
     end
   end
 
